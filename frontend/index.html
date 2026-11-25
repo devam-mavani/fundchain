@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FundChain</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.4/ethers.umd.min.js"></script>
+<script src="config.js"></script>
+<style>
+  :root { --bg:#0f1220; --card:#181c30; --text:#e8eaf6; --muted:#9aa0c3; --accent:#6c8cff; --ok:#3ecf8e; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; justify-content:space-between; align-items:center; padding:16px 24px; border-bottom:1px solid #262b4a; }
+  h1 { margin:0; font-size:1.3rem; }
+  main { max-width:900px; margin:0 auto; padding:24px; }
+  .card { background:var(--card); border-radius:12px; padding:18px; margin-bottom:18px; }
+  input, textarea, button, select { font:inherit; padding:9px 12px; border-radius:8px; border:1px solid #2d3359; background:#10142a; color:var(--text); }
+  input, textarea { width:100%; margin-bottom:10px; }
+  button { background:var(--accent); color:#fff; border:none; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; gap:10px; } .row > * { flex:1; }
+  .bar { height:8px; background:#10142a; border-radius:99px; overflow:hidden; margin:10px 0 6px; }
+  .bar > div { height:100%; background:var(--accent); }
+  .muted { color:var(--muted); font-size:.9rem; }
+  .badge { padding:2px 10px; border-radius:99px; font-size:.8rem; background:#262b4a; }
+  .Successful, .Withdrawn { color:var(--ok); } .Failed { color:var(--bad); }
+  .actions { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; } .actions input { width:140px; margin:0; }
+  details { margin-top:10px; } summary { cursor:pointer; color:var(--muted); }
+  #toast { position:fixed; bottom:20px; right:20px; background:#262b4a; padding:12px 16px; border-radius:10px; display:none; max-width:360px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>⛓ FundChain</h1>
+  <div><span id="acct" class="muted"></span> <button id="connect">Connect wallet</button></div>
+</header>
+<main>
+  <div class="card">
+    <h3 style="margin-top:0">Start a campaign</h3>
+    <input id="title" placeholder="Title" />
+    <textarea id="desc" rows="2" placeholder="Description"></textarea>
+    <div class="row">
+      <input id="goal" type="number" step="any" placeholder="Goal (ETH)" />
+      <input id="mins" type="number" placeholder="Duration (minutes)" />
+    </div>
+    <button id="create">Create campaign</button>
+  </div>
+  <h3>Campaigns</h3>
+  <div id="list" class="muted">Connect your wallet to load campaigns.</div>
+</main>
+<div id="toast"></div>
+
+<script>
+const ABI = [
+  "function createCampaign(string title,string description,uint256 goal,uint256 durationSeconds) returns (uint256)",
+  "function contribute(uint256 id) payable",
+  "function withdraw(uint256 id)",
+  "function refund(uint256 id)",
+  "function campaignCount() view returns (uint256)",
+  "function getCampaign(uint256 id) view returns (tuple(address creator,string title,string description,uint256 goal,uint256 deadline,uint256 totalRaised,bool withdrawn))",
+  "function status(uint256 id) view returns (uint8)",
+  "function contributions(uint256,address) view returns (uint256)",
+  "function getContributors(uint256 id) view returns (address[])"
+];
+const STATUS = ["Active", "Successful", "Failed", "Withdrawn"];
+const $ = (id) => document.getElementById(id);
+let provider, signer, contract, me;
+
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.style.display = "block"; setTimeout(() => t.style.display = "none", 5000); }
+function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+const short = (a) => a.slice(0, 6) + "…" + a.slice(-4);
+
+async function connect() {
+  if (!window.ethereum) return toast("Install MetaMask first.");
+  const cfg = window.FUNDCHAIN_CONFIG;
+  if (!cfg || !cfg.address) return toast("No contract address. Run the deploy script first.");
+  provider = new ethers.BrowserProvider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  const net = await provider.getNetwork();
+  if (Number(net.chainId) !== cfg.chainId) return toast("Switch MetaMask to chain " + cfg.chainId);
+  signer = await provider.getSigner();
+  me = await signer.getAddress();
+  contract = new ethers.Contract(cfg.address, ABI, signer);
+  $("acct").textContent = short(me);
+  $("connect").textContent = "Connected";
+  await load();
+}
+
+async function tx(promise, okMsg) {
+  try { const t = await promise; toast("Waiting for confirmation…"); await t.wait(); toast(okMsg); await load(); }
+  catch (e) { toast(e.reason || e.shortMessage || e.message); }
+}
+
+async function load() {
+  const n = Number(await contract.campaignCount());
+  if (n === 0) { $("list").innerHTML = "No campaigns yet — create the first one!"; return; }
+  let html = "";
+  for (let id = n - 1; id >= 0; id--) {
+    const c = await contract.getCampaign(id);
+    const st = STATUS[Number(await contract.status(id))];
+    const mine = await contract.contributions(id, me);
+    const people = await contract.getContributors(id);
+    const pct = Math.min(100, Number((c.totalRaised * 100n) / c.goal));
+    const ends = new Date(Number(c.deadline) * 1000).toLocaleString();
+    const isCreator = c.creator.toLowerCase() === me.toLowerCase();
+
+    let actions = "";
+    if (st === "Active") actions = `<input id="amt${id}" type="number" step="any" placeholder="ETH" />
+      <button onclick="contribute(${id})">Contribute</button>`;
+    if (st === "Successful" && isCreator) actions = `<button onclick="withdraw(${id})">Withdraw funds</button>`;
+    if (st === "Failed" && mine > 0n) actions = `<button onclick="refund(${id})">Refund ${ethers.formatEther(mine)} ETH</button>`;
+
+    const rows = (await Promise.all(people.map(async (p) =>
+      `<div class="muted">${short(p)} — ${ethers.formatEther(await contract.contributions(id, p))} ETH</div>`))).join("");
+
+    html += `<div class="card">
+      <div style="display:flex;justify-content:space-between"><strong>${esc(c.title)}</strong><span class="badge ${st}">${st}</span></div>
+      <p class="muted">${esc(c.description)}</p>
+      <div class="bar"><div style="width:${pct}%"></div></div>
+      <div class="muted">${ethers.formatEther(c.totalRaised)} / ${ethers.formatEther(c.goal)} ETH (${pct}%) · ends ${ends} · by ${short(c.creator)}</div>
+      <div class="actions">${actions}</div>
+      <details><summary>${people.length} contributor(s) — public ledger</summary>${rows || '<div class="muted">None yet</div>'}</details>
+    </div>`;
+  }
+  $("list").innerHTML = html;
+}
+
+window.contribute = (id) => {
+  const v = $("amt" + id).value;
+  if (!v || Number(v) <= 0) return toast("Enter an amount");
+  tx(contract.contribute(id, { value: ethers.parseEther(v) }), "Thanks for contributing!");
+};
+window.withdraw = (id) => tx(contract.withdraw(id), "Funds withdrawn.");
+window.refund = (id) => tx(contract.refund(id), "Refund sent.");
+
+$("connect").onclick = connect;
+$("create").onclick = () => {
+  if (!contract) return toast("Connect your wallet first.");
+  const goal = $("goal").value, mins = $("mins").value;
+  if (!$("title").value || !goal || !mins) return toast("Fill in title, goal and duration.");
+  tx(contract.createCampaign($("title").value, $("desc").value, ethers.parseEther(goal), BigInt(Math.round(Number(mins) * 60))), "Campaign created!");
+};
+if (window.ethereum) window.ethereum.on("accountsChanged", () => location.reload());
+</script>
+</body>
+</html>
